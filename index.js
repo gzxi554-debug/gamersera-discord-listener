@@ -101,7 +101,8 @@ client.on("messageCreate", async (message) => {
     }
 
     const channelId = message.channel.id;
-    const isStaff = message.member?.roles?.cache?.has(STAFF_ROLE_ID);
+    const member = await message.guild.members.fetch(message.author.id);
+const isStaff = member.roles.cache.has(STAFF_ROLE_ID);
     const isReplyingToSomeone = Boolean(message.reference?.messageId);
     const instantReply = shouldReplyInstantly(message.content);
 
