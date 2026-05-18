@@ -7,10 +7,10 @@ const PORT = process.env.PORT || 3000;
 
 const STAFF_ROLE_ID = "1378770600193032282";
 
-const USER_REPLY_DELAY_MS = 10000; // normal users: 10 seconds
+const USER_REPLY_DELAY_MS = 30000; // normal users: 30 seconds
 const STAFF_REPLY_DELAY_MS = 3000; // staff normal messages: 3 seconds
 const INSTANT_REPLY_DELAY_MS = 0; // strong tournament/help messages: instant
-const ACTIVE_CHAT_WINDOW_MS = 10000; // detect users chatting within 10 seconds
+const ACTIVE_CHAT_WINDOW_MS = 30000; // detect users chatting within 30 seconds
 
 const pendingReplies = new Map();
 
@@ -44,7 +44,6 @@ client.once("clientReady", () => {
 function getIntentFlags(content) {
   const text = content.toLowerCase();
 
-  // These are strong enough to reply instantly even if chat is active.
   const strongHelpKeywords = [
     "how do i join",
     "how to join",
@@ -64,7 +63,6 @@ function getIntentFlags(content) {
     "female only",
   ];
 
-  // These indicate likely tournament/help intent, but should NOT interrupt active conversations.
   const normalHelpKeywords = [
     "tournament",
     "tournaments",
@@ -186,7 +184,6 @@ client.on("messageCreate", async (message) => {
     console.log(`Instant Reply: ${instantReply}`);
     console.log(`Active Conversation: ${activeConversation}`);
 
-    // If staff replies directly to another user/message, cancel AI and stay quiet.
     if (isStaff && isReplyingToSomeone) {
       if (pendingReplies.has(channelId)) {
         clearTimeout(pendingReplies.get(channelId));
@@ -198,7 +195,6 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // If users are actively chatting, do not interrupt unless it is a strong help message.
     if (activeConversation && !strongHelpIntent && !isStaff) {
       if (pendingReplies.has(channelId)) {
         clearTimeout(pendingReplies.get(channelId));
@@ -210,7 +206,6 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // If another message appears before the delay finishes, cancel the previous pending reply.
     if (pendingReplies.has(channelId)) {
       clearTimeout(pendingReplies.get(channelId));
       pendingReplies.delete(channelId);
