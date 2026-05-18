@@ -6,7 +6,9 @@ const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const PORT = process.env.PORT || 3000;
 
 const STAFF_ROLE_ID = "1378770600193032282";
-const REPLY_DELAY_MS = 10000; // 10 seconds
+const USER_REPLY_DELAY_MS = 10000; // normal users: 10 seconds
+const STAFF_REPLY_DELAY_MS = 3000; // staff normal messages: 3 seconds
+const INSTANT_REPLY_DELAY_MS = 0; // tournament/help messages: instant
 
 const pendingReplies = new Map();
 
@@ -37,6 +39,55 @@ client.once("clientReady", () => {
   console.log("Bot is ready and listening for messages...");
 });
 
+function shouldReplyInstantly(content) {
+  const text = content.toLowerCase();
+
+  const instantReplyKeywords = [
+    "tournament",
+    "tournaments",
+    "tourney",
+    "tourneys",
+    "register",
+    "registration",
+    "sign up",
+    "signup",
+    "join",
+    "how to join",
+    "check in",
+    "check-in",
+    "checkin",
+    "prize",
+    "prizes",
+    "rules",
+    "format",
+    "schedule",
+    "time",
+    "dates",
+    "date",
+    "giveaway",
+    "giveaways",
+    "ladies",
+    "ladies only",
+    "women",
+    "female",
+    "fc",
+    "fifa",
+    "fc26",
+    "fortnite",
+    "rocket league",
+    "rl",
+    "valorant",
+    "warzone",
+    "scrim",
+    "custom",
+    "support",
+    "help",
+    "xp",
+  ];
+
+  return instantReplyKeywords.some((keyword) => text.includes(keyword));
+}
+
 client.on("messageCreate", async (message) => {
   try {
     if (message.author.bot) {
@@ -50,36 +101,54 @@ client.on("messageCreate", async (message) => {
     }
 
     const channelId = message.channel.id;
+    const isStaff = message.member?.roles?.cache?.has(STAFF_ROLE_ID);
+    const isReplyingToSomeone = Boolean(message.reference?.messageId);
+    const instantReply = shouldReplyInstantly(message.content);
 
     console.log("MESSAGE EVENT RECEIVED");
     console.log(`Message: ${message.content}`);
     console.log(`Message ID: ${message.id}`);
     console.log(`Channel ID: ${channelId}`);
     console.log(`Guild ID: ${message.guild?.id}`);
+    console.log(`Is Staff: ${Boolean(isStaff)}`);
+    console.log(`Is Replying To Someone: ${isReplyingToSomeone}`);
+    console.log(`Instant Reply: ${instantReply}`);
 
-    // If staff/mod talks, cancel any pending AI reply and do not intervene.
-    if (message.member?.roles?.cache?.has(STAFF_ROLE_ID)) {
+    // If staff replies directly to another user/message, cancel AI and stay quiet.
+    if (isStaff && isReplyingToSomeone) {
       if (pendingReplies.has(channelId)) {
         clearTimeout(pendingReplies.get(channelId));
         pendingReplies.delete(channelId);
-        console.log("Cancelled pending AI reply because staff responded");
+        console.log("Cancelled pending AI reply because staff replied to a user");
       }
 
-      console.log("Ignored staff message");
+      console.log("Ignored staff reply");
       return;
     }
 
-    // If another user talks before the delay finishes, cancel the previous pending reply.
+    // If another message appears before the delay finishes, cancel the previous pending reply.
     if (pendingReplies.has(channelId)) {
       clearTimeout(pendingReplies.get(channelId));
       pendingReplies.delete(channelId);
       console.log("Cancelled pending AI reply because conversation continued");
     }
 
-    // Wait 10 seconds. If nobody continues the chat, send this message to n8n.
+    // Tournament/help messages reply instantly.
+    // Staff normal messages reply in 3 seconds.
+    // Normal casual messages reply in 10 seconds if nobody continues chatting.
+    const delay = instantReply
+      ? INSTANT_REPLY_DELAY_MS
+      : isStaff
+        ? STAFF_REPLY_DELAY_MS
+        : USER_REPLY_DELAY_MS;
+
     const timeout = setTimeout(async () => {
       try {
-        console.log(`No new messages for 10s, sending to n8n: ${message.content}`);
+        console.log(
+          delay === 0
+            ? `Instant help/tournament message, sending to n8n: ${message.content}`
+            : `No new messages for ${delay / 1000}s, sending to n8n: ${message.content}`
+        );
 
         const response = await fetch(N8N_WEBHOOK_URL, {
           method: "POST",
@@ -92,6 +161,9 @@ client.on("messageCreate", async (message) => {
             user_id: message.author.id,
             username: message.author.username,
             is_bot: message.author.bot,
+            is_staff: Boolean(isStaff),
+            is_replying_to_someone: isReplyingToSomeone,
+            instant_reply: instantReply,
           }),
         });
 
@@ -107,7 +179,7 @@ client.on("messageCreate", async (message) => {
       } finally {
         pendingReplies.delete(channelId);
       }
-    }, REPLY_DELAY_MS);
+    }, delay);
 
     pendingReplies.set(channelId, timeout);
   } catch (error) {
