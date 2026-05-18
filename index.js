@@ -6,9 +6,11 @@ const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const PORT = process.env.PORT || 3000;
 
 const STAFF_ROLE_ID = "1378770600193032282";
+
 const USER_REPLY_DELAY_MS = 10000; // normal users: 10 seconds
 const STAFF_REPLY_DELAY_MS = 3000; // staff normal messages: 3 seconds
-const INSTANT_REPLY_DELAY_MS = 0; // tournament/help messages: instant
+const INSTANT_REPLY_DELAY_MS = 0; // strong tournament/help messages: instant
+const ACTIVE_CHAT_WINDOW_MS = 10000; // detect users chatting within 10 seconds
 
 const pendingReplies = new Map();
 
@@ -39,53 +41,105 @@ client.once("clientReady", () => {
   console.log("Bot is ready and listening for messages...");
 });
 
-function shouldReplyInstantly(content) {
+function getIntentFlags(content) {
   const text = content.toLowerCase();
 
-  const instantReplyKeywords = [
+  // These are strong enough to reply instantly even if chat is active.
+  const strongHelpKeywords = [
+    "how do i join",
+    "how to join",
+    "how can i join",
+    "where do i register",
+    "how do i register",
+    "how to register",
+    "registration",
+    "register for",
+    "sign up for",
+    "signup for",
+    "check in",
+    "check-in",
+    "checkin",
+    "ladies only",
+    "women only",
+    "female only",
+  ];
+
+  // These indicate likely tournament/help intent, but should NOT interrupt active conversations.
+  const normalHelpKeywords = [
     "tournament",
     "tournaments",
     "tourney",
     "tourneys",
-    "register",
-    "registration",
-    "sign up",
-    "signup",
-    "join",
-    "how to join",
-    "check in",
-    "check-in",
-    "checkin",
     "prize",
     "prizes",
     "rules",
     "format",
     "schedule",
-    "time",
     "dates",
     "date",
     "giveaway",
     "giveaways",
-    "ladies",
-    "ladies only",
-    "women",
-    "female",
-    "fc",
     "fifa",
     "fc26",
     "fortnite",
     "rocket league",
-    "rl",
     "valorant",
     "warzone",
     "scrim",
     "custom",
-    "support",
-    "help",
-    "xp",
   ];
 
-  return instantReplyKeywords.some((keyword) => text.includes(keyword));
+  const strongHelpIntent = strongHelpKeywords.some((keyword) =>
+    text.includes(keyword)
+  );
+
+  const normalHelpIntent = normalHelpKeywords.some((keyword) =>
+    text.includes(keyword)
+  );
+
+  return {
+    strongHelpIntent,
+    normalHelpIntent,
+    instantReply: strongHelpIntent || normalHelpIntent,
+  };
+}
+
+function getRecentHumanMessages(message) {
+  return message.channel.messages.cache.filter((m) =>
+    !m.author.bot &&
+    m.author.id !== message.author.id &&
+    Date.now() - m.createdTimestamp < ACTIVE_CHAT_WINDOW_MS
+  );
+}
+
+async function sendToN8n(message, meta) {
+  const response = await fetch(N8N_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      content: message.content,
+      message_id: message.id,
+      channel_id: message.channel.id,
+      guild_id: message.guild?.id,
+      user_id: message.author.id,
+      username: message.author.username,
+      is_bot: message.author.bot,
+      is_staff: Boolean(meta.isStaff),
+      is_replying_to_someone: meta.isReplyingToSomeone,
+      instant_reply: meta.instantReply,
+      strong_help_intent: meta.strongHelpIntent,
+      normal_help_intent: meta.normalHelpIntent,
+      active_conversation: meta.activeConversation,
+    }),
+  });
+
+  console.log(`n8n response status: ${response.status}`);
+
+  if (!response.ok) {
+    console.error("n8n webhook failed:", response.status, await response.text());
+  } else {
+    console.log("Sent message to n8n");
+  }
 }
 
 client.on("messageCreate", async (message) => {
@@ -100,11 +154,25 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
+    if (!message.guild) {
+      console.log("Ignored DM message");
+      return;
+    }
+
     const channelId = message.channel.id;
+
     const member = await message.guild.members.fetch(message.author.id);
-const isStaff = member.roles.cache.has(STAFF_ROLE_ID);
+    const isStaff = member.roles.cache.has(STAFF_ROLE_ID);
     const isReplyingToSomeone = Boolean(message.reference?.messageId);
-    const instantReply = shouldReplyInstantly(message.content);
+
+    const {
+      strongHelpIntent,
+      normalHelpIntent,
+      instantReply,
+    } = getIntentFlags(message.content);
+
+    const recentHumanMessages = getRecentHumanMessages(message);
+    const activeConversation = recentHumanMessages.size >= 1;
 
     console.log("MESSAGE EVENT RECEIVED");
     console.log(`Message: ${message.content}`);
@@ -113,7 +181,10 @@ const isStaff = member.roles.cache.has(STAFF_ROLE_ID);
     console.log(`Guild ID: ${message.guild?.id}`);
     console.log(`Is Staff: ${Boolean(isStaff)}`);
     console.log(`Is Replying To Someone: ${isReplyingToSomeone}`);
+    console.log(`Strong Help Intent: ${strongHelpIntent}`);
+    console.log(`Normal Help Intent: ${normalHelpIntent}`);
     console.log(`Instant Reply: ${instantReply}`);
+    console.log(`Active Conversation: ${activeConversation}`);
 
     // If staff replies directly to another user/message, cancel AI and stay quiet.
     if (isStaff && isReplyingToSomeone) {
@@ -127,6 +198,18 @@ const isStaff = member.roles.cache.has(STAFF_ROLE_ID);
       return;
     }
 
+    // If users are actively chatting, do not interrupt unless it is a strong help message.
+    if (activeConversation && !strongHelpIntent && !isStaff) {
+      if (pendingReplies.has(channelId)) {
+        clearTimeout(pendingReplies.get(channelId));
+        pendingReplies.delete(channelId);
+        console.log("Cancelled pending AI reply because users are actively chatting");
+      }
+
+      console.log("Ignored because users are actively chatting");
+      return;
+    }
+
     // If another message appears before the delay finishes, cancel the previous pending reply.
     if (pendingReplies.has(channelId)) {
       clearTimeout(pendingReplies.get(channelId));
@@ -134,47 +217,30 @@ const isStaff = member.roles.cache.has(STAFF_ROLE_ID);
       console.log("Cancelled pending AI reply because conversation continued");
     }
 
-    // Tournament/help messages reply instantly.
-    // Staff normal messages reply in 3 seconds.
-    // Normal casual messages reply in 10 seconds if nobody continues chatting.
-    const delay = instantReply
+    const delay = strongHelpIntent
       ? INSTANT_REPLY_DELAY_MS
-      : isStaff
-        ? STAFF_REPLY_DELAY_MS
-        : USER_REPLY_DELAY_MS;
+      : normalHelpIntent && !activeConversation
+        ? INSTANT_REPLY_DELAY_MS
+        : isStaff
+          ? STAFF_REPLY_DELAY_MS
+          : USER_REPLY_DELAY_MS;
 
     const timeout = setTimeout(async () => {
       try {
         console.log(
           delay === 0
-            ? `Instant help/tournament message, sending to n8n: ${message.content}`
+            ? `Instant allowed message, sending to n8n: ${message.content}`
             : `No new messages for ${delay / 1000}s, sending to n8n: ${message.content}`
         );
 
-        const response = await fetch(N8N_WEBHOOK_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            content: message.content,
-            message_id: message.id,
-            channel_id: message.channel.id,
-            guild_id: message.guild?.id,
-            user_id: message.author.id,
-            username: message.author.username,
-            is_bot: message.author.bot,
-            is_staff: Boolean(isStaff),
-            is_replying_to_someone: isReplyingToSomeone,
-            instant_reply: instantReply,
-          }),
+        await sendToN8n(message, {
+          isStaff,
+          isReplyingToSomeone,
+          instantReply: delay === 0,
+          strongHelpIntent,
+          normalHelpIntent,
+          activeConversation,
         });
-
-        console.log(`n8n response status: ${response.status}`);
-
-        if (!response.ok) {
-          console.error("n8n webhook failed:", response.status, await response.text());
-        } else {
-          console.log("Sent message to n8n");
-        }
       } catch (error) {
         console.error("Failed to send to n8n:", error);
       } finally {
