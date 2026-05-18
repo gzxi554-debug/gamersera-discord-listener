@@ -6,18 +6,29 @@ const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const PORT = process.env.PORT || 3000;
 
 const STAFF_ROLE_ID = "1378770600193032282";
+const REPLY_DELAY_MS = 10000; // 10 seconds
+
 const pendingReplies = new Map();
 
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("Bot running");
-}).listen(PORT, () => console.log(`Keep-alive server running on port ${PORT}`));
+if (!DISCORD_TOKEN || !N8N_WEBHOOK_URL) {
+  console.error("Missing DISCORD_TOKEN or N8N_WEBHOOK_URL");
+  process.exit(1);
+}
+
+http
+  .createServer((req, res) => {
+    res.writeHead(200);
+    res.end("Bot running");
+  })
+  .listen(PORT, () => {
+    console.log(`Keep-alive server running on port ${PORT}`);
+  });
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.MessageContent,
   ],
 });
 
@@ -42,6 +53,7 @@ client.on("messageCreate", async (message) => {
 
     console.log("MESSAGE EVENT RECEIVED");
     console.log(`Message: ${message.content}`);
+    console.log(`Message ID: ${message.id}`);
     console.log(`Channel ID: ${channelId}`);
     console.log(`Guild ID: ${message.guild?.id}`);
 
@@ -64,21 +76,22 @@ client.on("messageCreate", async (message) => {
       console.log("Cancelled pending AI reply because conversation continued");
     }
 
-    // Wait 5 seconds. If nobody continues the chat, send this message to n8n.
+    // Wait 10 seconds. If nobody continues the chat, send this message to n8n.
     const timeout = setTimeout(async () => {
       try {
-        console.log(`No new messages for 5s, sending to n8n: ${message.content}`);
+        console.log(`No new messages for 10s, sending to n8n: ${message.content}`);
 
         const response = await fetch(N8N_WEBHOOK_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             content: message.content,
+            message_id: message.id,
             channel_id: message.channel.id,
             guild_id: message.guild?.id,
             user_id: message.author.id,
             username: message.author.username,
-            is_bot: message.author.bot
+            is_bot: message.author.bot,
           }),
         });
 
@@ -94,10 +107,9 @@ client.on("messageCreate", async (message) => {
       } finally {
         pendingReplies.delete(channelId);
       }
-    }, 5000);
+    }, REPLY_DELAY_MS);
 
     pendingReplies.set(channelId, timeout);
-
   } catch (error) {
     console.error("Listener error:", error);
   }
