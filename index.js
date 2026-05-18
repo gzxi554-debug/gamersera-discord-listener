@@ -7,10 +7,10 @@ const PORT = process.env.PORT || 3000;
 
 const STAFF_ROLE_ID = "1378770600193032282";
 
-const USER_REPLY_DELAY_MS = 30000; // normal users: 30 seconds
+const USER_REPLY_DELAY_MS = 30000; // one normal user: 30 seconds
 const STAFF_REPLY_DELAY_MS = 3000; // staff normal messages: 3 seconds
-const INSTANT_REPLY_DELAY_MS = 0; // strong tournament/help messages: instant
-const ACTIVE_CHAT_WINDOW_MS = 30000; // detect users chatting within 30 seconds
+const INSTANT_REPLY_DELAY_MS = 0; // bot mention / clear help: instant
+const ACTIVE_CHAT_WINDOW_MS = 30000; // detects 2+ users chatting within 30 seconds
 
 const pendingReplies = new Map();
 
@@ -98,11 +98,10 @@ function getIntentFlags(content) {
   return {
     strongHelpIntent,
     normalHelpIntent,
-    instantReply: strongHelpIntent || normalHelpIntent,
   };
 }
 
-function getRecentHumanMessages(message) {
+function getRecentOtherHumanMessages(message) {
   return message.channel.messages.cache.filter((m) =>
     !m.author.bot &&
     m.author.id !== message.author.id &&
@@ -124,7 +123,7 @@ async function sendToN8n(message, meta) {
       is_bot: message.author.bot,
       is_staff: Boolean(meta.isStaff),
       is_replying_to_someone: meta.isReplyingToSomeone,
-      instant_reply: meta.instantReply,
+      bot_mentioned: meta.botMentioned,
       strong_help_intent: meta.strongHelpIntent,
       normal_help_intent: meta.normalHelpIntent,
       active_conversation: meta.activeConversation,
@@ -162,15 +161,12 @@ client.on("messageCreate", async (message) => {
     const member = await message.guild.members.fetch(message.author.id);
     const isStaff = member.roles.cache.has(STAFF_ROLE_ID);
     const isReplyingToSomeone = Boolean(message.reference?.messageId);
+    const botMentioned = message.mentions.has(client.user);
 
-    const {
-      strongHelpIntent,
-      normalHelpIntent,
-      instantReply,
-    } = getIntentFlags(message.content);
+    const { strongHelpIntent, normalHelpIntent } = getIntentFlags(message.content);
 
-    const recentHumanMessages = getRecentHumanMessages(message);
-    const activeConversation = recentHumanMessages.size >= 1;
+    const recentOtherHumanMessages = getRecentOtherHumanMessages(message);
+    const activeConversation = recentOtherHumanMessages.size >= 1;
 
     console.log("MESSAGE EVENT RECEIVED");
     console.log(`Message: ${message.content}`);
@@ -179,11 +175,12 @@ client.on("messageCreate", async (message) => {
     console.log(`Guild ID: ${message.guild?.id}`);
     console.log(`Is Staff: ${Boolean(isStaff)}`);
     console.log(`Is Replying To Someone: ${isReplyingToSomeone}`);
+    console.log(`Bot Mentioned: ${botMentioned}`);
     console.log(`Strong Help Intent: ${strongHelpIntent}`);
     console.log(`Normal Help Intent: ${normalHelpIntent}`);
-    console.log(`Instant Reply: ${instantReply}`);
     console.log(`Active Conversation: ${activeConversation}`);
 
+    // If staff replies directly to a user/message, cancel AI and stay quiet.
     if (isStaff && isReplyingToSomeone) {
       if (pendingReplies.has(channelId)) {
         clearTimeout(pendingReplies.get(channelId));
@@ -195,30 +192,34 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    if (activeConversation && !strongHelpIntent && !isStaff) {
+    // If 2+ users are chatting, do NOT intervene at all unless the bot is mentioned.
+    if (activeConversation && !botMentioned) {
       if (pendingReplies.has(channelId)) {
         clearTimeout(pendingReplies.get(channelId));
         pendingReplies.delete(channelId);
-        console.log("Cancelled pending AI reply because users are actively chatting");
+        console.log("Cancelled pending AI reply because 2+ users are chatting");
       }
 
-      console.log("Ignored because users are actively chatting");
+      console.log("Ignored because 2+ users are chatting");
       return;
     }
 
+    // If another message appears before the delay finishes, cancel the previous pending reply.
     if (pendingReplies.has(channelId)) {
       clearTimeout(pendingReplies.get(channelId));
       pendingReplies.delete(channelId);
       console.log("Cancelled pending AI reply because conversation continued");
     }
 
-    const delay = strongHelpIntent
+    const delay = botMentioned
       ? INSTANT_REPLY_DELAY_MS
-      : normalHelpIntent && !activeConversation
+      : strongHelpIntent
         ? INSTANT_REPLY_DELAY_MS
-        : isStaff
-          ? STAFF_REPLY_DELAY_MS
-          : USER_REPLY_DELAY_MS;
+        : normalHelpIntent
+          ? INSTANT_REPLY_DELAY_MS
+          : isStaff
+            ? STAFF_REPLY_DELAY_MS
+            : USER_REPLY_DELAY_MS;
 
     const timeout = setTimeout(async () => {
       try {
@@ -231,7 +232,7 @@ client.on("messageCreate", async (message) => {
         await sendToN8n(message, {
           isStaff,
           isReplyingToSomeone,
-          instantReply: delay === 0,
+          botMentioned,
           strongHelpIntent,
           normalHelpIntent,
           activeConversation,
