@@ -12,7 +12,14 @@ const STAFF_REPLY_DELAY_MS = 3000; // staff normal messages: 3 seconds
 const INSTANT_REPLY_DELAY_MS = 0; // bot mention / clear help: instant
 const ACTIVE_CHAT_WINDOW_MS = 30000; // detects 2+ users chatting within 30 seconds
 
+const USER_COOLDOWN_MS = 30000; // 30 seconds per user
+const USER_MUTE_MS = 3600000; // 1 hour
+const REPLY_CHAIN_COOLDOWN_MS = 60000; // 1 minute
+
 const pendingReplies = new Map();
+const userCooldowns = new Map();
+const mutedUsers = new Map();
+const recentlyReplyingUsers = new Map();
 
 if (!DISCORD_TOKEN || !N8N_WEBHOOK_URL) {
   console.error("Missing DISCORD_TOKEN or N8N_WEBHOOK_URL");
@@ -109,6 +116,36 @@ function getRecentOtherHumanMessages(message) {
   );
 }
 
+function isEmojiOnly(content) {
+  const text = content.trim();
+  if (!text) return false;
+
+  const withoutEmoji = text
+    .replace(/\p{Emoji_Presentation}/gu, "")
+    .replace(/\p{Emoji}\uFE0F/gu, "")
+    .replace(/[\s\u200d]/g, "");
+
+  return withoutEmoji.length === 0;
+}
+
+function containsStopRequest(content) {
+  const text = content.toLowerCase();
+
+  const stopKeywords = [
+    "stop",
+    "shut up",
+    "leave me alone",
+    "be quiet",
+    "stfu",
+    "dont talk",
+    "don't talk",
+    "mute",
+    "annoying",
+  ];
+
+  return stopKeywords.some((keyword) => text.includes(keyword));
+}
+
 async function sendToN8n(message, meta) {
   const response = await fetch(N8N_WEBHOOK_URL, {
     method: "POST",
@@ -124,6 +161,7 @@ async function sendToN8n(message, meta) {
       is_staff: Boolean(meta.isStaff),
       is_replying_to_someone: meta.isReplyingToSomeone,
       bot_mentioned: meta.botMentioned,
+      mentioned_other_user: meta.mentionedOtherUser,
       strong_help_intent: meta.strongHelpIntent,
       normal_help_intent: meta.normalHelpIntent,
       active_conversation: meta.activeConversation,
@@ -157,13 +195,18 @@ client.on("messageCreate", async (message) => {
     }
 
     const channelId = message.channel.id;
+    const content = message.content.trim();
+    const now = Date.now();
 
     const member = await message.guild.members.fetch(message.author.id);
     const isStaff = member.roles.cache.has(STAFF_ROLE_ID);
     const isReplyingToSomeone = Boolean(message.reference?.messageId);
     const botMentioned = message.mentions.has(client.user);
 
-    const { strongHelpIntent, normalHelpIntent } = getIntentFlags(message.content);
+    const mentionedOtherUser =
+      message.mentions.users.size > (botMentioned ? 1 : 0);
+
+    const { strongHelpIntent, normalHelpIntent } = getIntentFlags(content);
 
     const recentOtherHumanMessages = getRecentOtherHumanMessages(message);
     const activeConversation = recentOtherHumanMessages.size >= 1;
@@ -176,11 +219,65 @@ client.on("messageCreate", async (message) => {
     console.log(`Is Staff: ${Boolean(isStaff)}`);
     console.log(`Is Replying To Someone: ${isReplyingToSomeone}`);
     console.log(`Bot Mentioned: ${botMentioned}`);
+    console.log(`Mentioned Other User: ${mentionedOtherUser}`);
     console.log(`Strong Help Intent: ${strongHelpIntent}`);
     console.log(`Normal Help Intent: ${normalHelpIntent}`);
     console.log(`Active Conversation: ${activeConversation}`);
 
-    // If staff replies directly to a user/message, cancel AI and stay quiet.
+    if (containsStopRequest(content) && !botMentioned) {
+      mutedUsers.set(message.author.id, now + USER_MUTE_MS);
+
+      if (pendingReplies.has(channelId)) {
+        clearTimeout(pendingReplies.get(channelId));
+        pendingReplies.delete(channelId);
+      }
+
+      console.log(`Muted user ${message.author.username} for 1 hour`);
+      return;
+    }
+
+    const muteUntil = mutedUsers.get(message.author.id) || 0;
+
+    if (now < muteUntil && !botMentioned) {
+      console.log("Ignored muted user");
+      return;
+    }
+
+    if (content.length < 4 && !botMentioned) {
+      console.log("Ignored short message");
+      return;
+    }
+
+    if (isEmojiOnly(content) && !botMentioned) {
+      console.log("Ignored emoji-only message");
+      return;
+    }
+
+    if (mentionedOtherUser && !botMentioned) {
+      console.log("Ignored because user mentioned another user");
+      return;
+    }
+
+    const replyCooldownUntil = recentlyReplyingUsers.get(message.author.id) || 0;
+    const userRecentlyReplied = now < replyCooldownUntil;
+
+    if (isReplyingToSomeone && !botMentioned) {
+      recentlyReplyingUsers.set(message.author.id, now + REPLY_CHAIN_COOLDOWN_MS);
+
+      if (pendingReplies.has(channelId)) {
+        clearTimeout(pendingReplies.get(channelId));
+        pendingReplies.delete(channelId);
+      }
+
+      console.log("Ignored because user replied to another message. Reply-chain cooldown started.");
+      return;
+    }
+
+    if (userRecentlyReplied && !botMentioned) {
+      console.log("Ignored because user recently replied in a conversation");
+      return;
+    }
+
     if (isStaff && isReplyingToSomeone) {
       if (pendingReplies.has(channelId)) {
         clearTimeout(pendingReplies.get(channelId));
@@ -192,7 +289,6 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // If 2+ users are chatting, do NOT intervene at all unless the bot is mentioned.
     if (activeConversation && !botMentioned) {
       if (pendingReplies.has(channelId)) {
         clearTimeout(pendingReplies.get(channelId));
@@ -204,7 +300,13 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // If another message appears before the delay finishes, cancel the previous pending reply.
+    const cooldownUntil = userCooldowns.get(message.author.id) || 0;
+
+    if (now < cooldownUntil && !botMentioned) {
+      console.log("Ignored because user is on cooldown");
+      return;
+    }
+
     if (pendingReplies.has(channelId)) {
       clearTimeout(pendingReplies.get(channelId));
       pendingReplies.delete(channelId);
@@ -229,10 +331,13 @@ client.on("messageCreate", async (message) => {
             : `No new messages for ${delay / 1000}s, sending to n8n: ${message.content}`
         );
 
+        userCooldowns.set(message.author.id, Date.now() + USER_COOLDOWN_MS);
+
         await sendToN8n(message, {
           isStaff,
           isReplyingToSomeone,
           botMentioned,
+          mentionedOtherUser,
           strongHelpIntent,
           normalHelpIntent,
           activeConversation,
